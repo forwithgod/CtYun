@@ -130,12 +130,17 @@ async Task KeepAliveWorkerWithForcedReset(CtYunApi api, AccountConfig account, D
 {
     var label = AccountLabel(account);
     var initialPayload = Convert.FromBase64String("UkVEUQIAAAACAAAAGgAAAAAAAAABAAEAAAABAAAAEgAAAAkAAAAECAAA");
-    var uri = new Uri($"wss://{desktop.DesktopInfo.ClinkLvsOutHost}/clinkProxy/{desktop.DesktopId}/MAIN");
+    var consecutiveFailures = 0;
 
     while (!globalToken.IsCancellationRequested)
     {
+        // 在配置值附近做 ±5 秒抖动，避免固定间隔形成过于明显的重连特征。
+        var cycleSeconds = Math.Max(10, keepAliveSeconds + Random.Shared.Next(-5, 6));
+        var cycleStartedAt = DateTime.UtcNow;
+        var uri = new Uri($"wss://{desktop.DesktopInfo.ClinkLvsOutHost}/clinkProxy/{desktop.DesktopId}/MAIN");
+
         using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(globalToken);
-        sessionCts.CancelAfter(TimeSpan.FromSeconds(keepAliveSeconds));
+        sessionCts.CancelAfter(TimeSpan.FromSeconds(cycleSeconds));
 
         using var client = new ClientWebSocket();
         client.Options.SetRequestHeader("Origin", "https://pc.ctyun.cn");
@@ -143,7 +148,7 @@ async Task KeepAliveWorkerWithForcedReset(CtYunApi api, AccountConfig account, D
 
         try
         {
-            Utility.WriteLine(ConsoleColor.Cyan, $"[{label}][{desktop.DesktopCode}] === 新周期开始，尝试连接 ===");
+            Utility.WriteLine(ConsoleColor.Cyan, $"[{label}][{desktop.DesktopCode}] === 新周期开始，尝试连接（保持 {cycleSeconds} 秒）===");
             await client.ConnectAsync(uri, sessionCts.Token);
 
             var hostParts = desktop.DesktopInfo.ClinkLvsOutHost.Split(':', 2);
@@ -166,28 +171,61 @@ async Task KeepAliveWorkerWithForcedReset(CtYunApi api, AccountConfig account, D
             await Task.Delay(500, sessionCts.Token);
             await client.SendAsync(initialPayload, WebSocketMessageType.Binary, true, sessionCts.Token);
 
-            Utility.WriteLine(ConsoleColor.Green, $"[{label}][{desktop.DesktopCode}] 连接已就绪，保持 {keepAliveSeconds} 秒...");
+            Utility.WriteLine(ConsoleColor.Green, $"[{label}][{desktop.DesktopCode}] 连接已就绪，保持 {cycleSeconds} 秒...");
 
             try
             {
                 await ReceiveLoop(api, client, account, desktop, sessionCts.Token);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (!globalToken.IsCancellationRequested)
             {
                 Utility.WriteLine(ConsoleColor.Yellow, $"[{label}][{desktop.DesktopCode}] 周期时间到，准备重连...");
+                consecutiveFailures = 0;
             }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException) when (globalToken.IsCancellationRequested)
         {
+            break;
+        }
+        catch (OperationCanceledException)
+        {
+            // 连接或发送阶段就到达周期时间，同样属于正常的周期切换，不能当成异常把整个程序带退出。
+            Utility.WriteLine(ConsoleColor.Yellow, $"[{label}][{desktop.DesktopCode}] 周期时间到，准备重连...");
+            consecutiveFailures = 0;
+        }
+        catch (WebSocketException ex)
+        {
+            var lived = DateTime.UtcNow - cycleStartedAt;
+            if (lived >= TimeSpan.FromSeconds(cycleSeconds * 0.8))
+            {
+                // 服务端在周期末尾先断开、客户端恰好也在关闭，属于正常的边界竞态。
+                Utility.WriteLine(ConsoleColor.DarkGreen, $"[{label}][{desktop.DesktopCode}] 周期结束，服务端先行断开。");
+                consecutiveFailures = 0;
+            }
+            else
+            {
+                consecutiveFailures++;
+                var delay = Math.Min(60, 5 * consecutiveFailures);
+                Utility.WriteLine(ConsoleColor.DarkYellow, $"[{label}][{desktop.DesktopCode}] 连接被对端断开（{ex.WebSocketErrorCode}），{delay} 秒后重连，连续第 {consecutiveFailures} 次。");
+
+                if (consecutiveFailures >= 3)
+                {
+                    // 连续多次被断开，可能是云端会话或证书信息已经失效，重新拉取 connect 信息。
+                    await RefreshDesktopInfoAsync(api, desktop, label);
+                }
+
+                await DelayBeforeReconnectAsync(delay, globalToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            consecutiveFailures++;
             Utility.WriteLine(ConsoleColor.Red, $"[{label}][{desktop.DesktopCode}] 异常: {ex.Message}");
-            await Task.Delay(5000, globalToken);
+            await DelayBeforeReconnectAsync(5, globalToken);
         }
         finally
         {
-            if (client.State == WebSocketState.Open)
-            {
-                await client.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Timeout Reset", CancellationToken.None);
-            }
+            await TryCloseAsync(client);
         }
     }
 }
@@ -195,27 +233,57 @@ async Task KeepAliveWorkerWithForcedReset(CtYunApi api, AccountConfig account, D
 async Task ReceiveLoop(CtYunApi api, ClientWebSocket ws, AccountConfig account, Desktop desktop, CancellationToken ct)
 {
     var buffer = new byte[8192];
+    using var message = new MemoryStream();
     var encryptor = new Encryption();
     var label = AccountLabel(account);
 
     while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
     {
-        var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
-        if (result.MessageType == WebSocketMessageType.Close) break;
+        // 一个 WebSocket 消息可能被拆成多帧，先拼完整再解析。
+        message.SetLength(0);
+        message.Position = 0;
+        WebSocketReceiveResult result;
+        do
+        {
+            result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
+            if (result.MessageType == WebSocketMessageType.Close)
+            {
+                Utility.WriteLine(ConsoleColor.DarkYellow, $"[{label}][{desktop.DesktopCode}] 收到关闭帧，结束本周期。");
+                await TryCloseAsync(ws);
+                return;
+            }
 
-        if (result.Count == 0)
+            if (result.Count > 0)
+            {
+                message.Write(buffer, 0, result.Count);
+            }
+        }
+        while (!result.EndOfMessage);
+
+        if (message.Length == 0)
         {
             continue;
         }
 
-        var data = buffer.AsSpan(0, result.Count).ToArray();
-        var hex = BitConverter.ToString(data).Replace("-", "");
-        if (hex.StartsWith("52454451", StringComparison.OrdinalIgnoreCase))
+        var data = message.ToArray();
+        if (data.Length >= 4 && data[0] == 0x52 && data[1] == 0x45 && data[2] == 0x44 && data[3] == 0x51)
         {
             Utility.WriteLine(ConsoleColor.Green, $"[{label}][{desktop.DesktopCode}] -> 收到保活校验");
-            var response = encryptor.Execute(data);
-            await ws.SendAsync(response, WebSocketMessageType.Binary, true, ct);
-            Utility.WriteLine(ConsoleColor.DarkGreen, $"[{label}][{desktop.DesktopCode}] -> 发送保活响应成功");
+            try
+            {
+                var response = encryptor.Execute(data);
+                await ws.SendAsync(response, WebSocketMessageType.Binary, true, ct);
+                Utility.WriteLine(ConsoleColor.DarkGreen, $"[{label}][{desktop.DesktopCode}] -> 发送保活响应成功");
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // 单次响应失败不应该让整个周期直接崩掉，交由服务端超时后按断线重连。
+                Utility.WriteLine(ConsoleColor.DarkYellow, $"[{label}][{desktop.DesktopCode}] 保活响应失败: {ex.Message}");
+            }
             continue;
         }
 
@@ -236,6 +304,55 @@ async Task ReceiveLoop(CtYunApi api, ClientWebSocket ws, AccountConfig account, 
         {
             Utility.WriteLine(ConsoleColor.DarkYellow, $"[{label}][{desktop.DesktopCode}] 消息解析失败: {ex.Message}");
         }
+    }
+}
+
+async Task RefreshDesktopInfoAsync(CtYunApi api, Desktop desktop, string label)
+{
+    try
+    {
+        var result = await api.ConnectAsync(desktop.DesktopId);
+        if (result.Success && result.Data?.DesktopInfo != null)
+        {
+            desktop.DesktopInfo = result.Data.DesktopInfo;
+            Utility.WriteLine(ConsoleColor.Yellow, $"[{label}][{desktop.DesktopCode}] 已刷新连接信息。");
+        }
+        else
+        {
+            Utility.WriteLine(ConsoleColor.Red, $"[{label}][{desktop.DesktopCode}] 刷新连接信息失败：{result.Msg}");
+        }
+    }
+    catch (Exception ex)
+    {
+        Utility.WriteLine(ConsoleColor.Red, $"[{label}][{desktop.DesktopCode}] 刷新连接信息异常：{ex.Message}");
+    }
+}
+
+async Task DelayBeforeReconnectAsync(int seconds, CancellationToken ct)
+{
+    try
+    {
+        await Task.Delay(TimeSpan.FromSeconds(seconds), ct);
+    }
+    catch (OperationCanceledException)
+    {
+        // 收到退出信号，交给 while 条件结束。
+    }
+}
+
+static async Task TryCloseAsync(ClientWebSocket ws)
+{
+    try
+    {
+        if (ws.State is WebSocketState.Open or WebSocketState.CloseReceived)
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "cycle end", cts.Token);
+        }
+    }
+    catch
+    {
+        // 对端已经断开时关闭会失败，忽略即可。
     }
 }
 
